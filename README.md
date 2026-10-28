@@ -2,7 +2,7 @@
 
 Learn concurrency by building a mini stock exchange, breaking it on purpose, and fixing it.
 
-**Budget: 60 hours** (20 days x 3 hours). Every step below lists its hours. Learning time is included.
+**Budget: 80 hours** (about 27 days x 3 hours). Every step below lists its hours. Learning time is included.
 
 ---
 
@@ -17,7 +17,7 @@ A mini exchange, like the core of NSE or Nasdaq:
 
 The exchange is only the vehicle. The real subject is: **what breaks when thousands of orders arrive at the same time, and how do you fix it?**
 
-**Stack:** Java 21, Maven, JUnit 5. Spring Boot only in the last step. No database, Redis or Docker in the core 60 hours.
+**Stack:** Java 21, Maven, JUnit 5. Steps 1 to 14 are pure Java (no framework, no database). Steps 15 to 21 add CompletableFuture, PostgreSQL, Redis, Spring Boot and WebSocket, JMH.
 
 **Data:** none needed. You generate random orders with a seeded generator. Same seed = same orders every run.
 
@@ -54,8 +54,14 @@ Order matters. Do not skip steps.
 | 12 | Market data for many readers | 4 |
 | 13 | Idempotency | 3 |
 | 14 | Stress test | 4 |
-| 15 | REST API and final README | 3 |
-| | **Total** | **60** |
+| 15 | CompletableFuture and virtual threads | 4 |
+| 16 | PostgreSQL concurrency | 5 |
+| 17 | Redis idempotency | 3 |
+| 18 | REST API and WebSocket feed | 5 |
+| 19 | JMH benchmarks and StampedLock | 3 |
+| 20 | Real market data replay | 1 |
+| 21 | Final stress run and README | 2 |
+| | **Total** | **80** |
 
 ---
 
@@ -71,7 +77,7 @@ account/       Account, AccountService
 concurrent/    Sequencer, Shard, Engine variants
 sim/           OrderGenerator, StressRunner
 drills/        small standalone demos
-api/           Spring Boot controllers (Step 15)
+api/           Spring Boot controllers (Step 18)
 ```
 
 - Create `docs/STUDY.md` (an empty list of links) and a `docs/topics/` folder.
@@ -563,17 +569,157 @@ if (existing != null) return existing;      // duplicate: hand back the ORIGINAL
 
 ---
 
-## Step 15: REST API and final README (3 hours)
+# Part 5: Real-service features (23 hours)
+
+Steps 15 to 21 need Docker (for PostgreSQL and Redis). Add a `docker-compose.yml` with both before Step 16.
+
+## Step 15: CompletableFuture and virtual threads (4 hours)
+
+**Learn**
+- A `CompletableFuture<T>` is a box for a result that arrives later. You attach steps to it instead of waiting.
+  - `thenApply(f)`: transform the result.
+  - `thenCompose(f)`: the next step itself returns a future (use this to chain async steps).
+  - `thenCombine(other, f)`: wait for two futures, then merge.
+  - `exceptionally(f)` / `handle(f)`: deal with failure. `handle` sees both result and error.
+  - `orTimeout(2, TimeUnit.SECONDS)`: fail if it takes too long.
+- By default `supplyAsync(...)` runs on a shared common pool. Always pass your own executor so you control which threads run your steps.
+- **Virtual threads (Java 21):** very cheap threads managed by the JVM. You can have 100,000 of them. They are great when threads mostly **wait** (database, Redis, network). They do not help CPU-heavy work.
+- Create them with `Executors.newVirtualThreadPerTaskExecutor()`.
+- **Pinning:** in Java 21, blocking while inside a `synchronized` block holds the underlying OS thread. Prefer `ReentrantLock` around blocking code.
+
+**Drill (1 hour):** chain three stages with a failure injected in the middle:
+```java
+CompletableFuture.supplyAsync(() -> validate(o), pool)
+    .thenCompose(v -> reserveAsync(v))
+    .thenApply(r -> route(r))
+    .handle((res, err) -> err != null ? Result.failed(err.getMessage()) : res);
+```
 
 **Build**
-- A minimal Spring Boot app wrapping `ShardedEngine`:
-  - `POST /orders` (200 accepted, 400 rejected, 429 overloaded)
-  - `DELETE /orders/{id}`
-  - `GET /book/{symbol}` (reads the Step 12 snapshot)
-- A small load script that posts orders from many threads.
-- Final project README with: architecture diagram, the speed tables from Steps 6, 10 and 12, and a **"Bugs I reproduced and fixed"** section with the race, the lost update, the deadlock (paste the real `jstack` text), the memory blow-up, and the duplicate order.
+- Turn `submit` into a pipeline: validate, dedupe, reserve, route to shard, wait for the shard's result, with `.orTimeout(...)`.
+- Run intake once on the platform thread pool and once on virtual threads. Compare throughput when each order does a fake 5 ms blocking call (`Thread.sleep(5)`).
+- Latency: record each order's `System.nanoTime()` duration into an array, sort it, print p50 and p99.
 
-**Check:** a fresh clone runs with `mvn test` green and `mvn spring-boot:run` serves the API.
+**Break it:** let a stage throw an exception with no `handle`. The order silently never completes. Fix with explicit `handle`.
+
+**Check:** every order ends in exactly one final state (including "failed" and "timed out"). Latency numbers saved in `docs/benchmarks.md`.
+
+---
+
+## Step 16: PostgreSQL concurrency (5 hours)
+
+**Learn**
+- **Transaction:** a group of changes that all happen or none happen (`BEGIN` ... `COMMIT`).
+- **Isolation level:** how much concurrent transactions can see of each other. PostgreSQL default is `READ COMMITTED`: you only see committed data, but a row can change between two of your reads.
+- **Lost update:** two transactions read balance 100, both add 10, both write 110. One update vanishes. Same bug as `count++`, but in the database.
+- **Write skew (concept):** two transactions each check a rule using different rows, both pass, together they break the rule. Fixed only by `SERIALIZABLE` or explicit locks.
+- Three fixes for lost update:
+  1. **Atomic update in SQL:** `UPDATE accounts SET cash = cash - ? WHERE id = ? AND cash >= ?` (check rows updated = 1).
+  2. **Optimistic locking:** a `version` column. `UPDATE ... SET cash=?, version=version+1 WHERE id=? AND version=?`. If 0 rows updated, someone else won: re-read and retry. Good when conflicts are rare.
+  3. **Pessimistic locking:** `SELECT ... FOR UPDATE` locks the row until you commit. Good when conflicts are frequent. Lock rows in id order to avoid deadlock (same rule as Step 8).
+
+**Drill (1.5 hours):** plain JDBC, two threads on one row: read, sleep 50 ms, write. Show the lost update. Fix it all three ways.
+
+**Build**
+- Tables: `accounts(id, cash, version)`, `positions(account_id, symbol, shares)`, `orders(...)`, `trades(...)`.
+- **The matcher thread must never wait on the database.** It puts trade events on a bounded queue. One writer thread drains the queue and writes trades plus balance changes in **one transaction** (batch several at a time).
+- Use plain JDBC with a small connection pool (HikariCP, or your Step 11 semaphore pool).
+
+**Break it:** run two concurrent writers updating the same account with read-then-write at `READ COMMITTED`. Watch cash go wrong.
+
+**Check:** after a stress run, database totals (cash and shares) equal the in-memory totals, and totals match the starting amounts.
+
+---
+
+## Step 17: Redis idempotency (3 hours)
+
+**Learn**
+- Redis is a very fast in-memory key-value store shared by all your app instances.
+- `SET key value NX EX 60` means: set only if the key does not exist, expire after 60 seconds. It is atomic, so exactly one caller gets "OK". This is `putIfAbsent` that works across many servers.
+- Two layers:
+  - **Redis NX:** fast check that stops most duplicates cheaply.
+  - **Database unique constraint** on `(account_id, client_order_id)`: the final truth. Redis can lose data or the key can expire; the database cannot.
+- A duplicate request returns the **original order's result** (read it from the DB), not an error.
+- **Distributed lock caveat (concept):** a Redis lock with an expiry can expire while the holder is still working, and then two holders run at once. That is why the DB constraint is the real guard.
+
+**Build**
+- Add Redis to `docker-compose.yml`. Use Jedis or Lettuce.
+- Flow: Redis `SET NX` fails: fetch and return the existing order. Succeeds: insert the order row. If the insert hits the unique constraint: return the existing order.
+
+**Break it:** send 100 concurrent duplicates. Remove Redis (DB alone should still allow only one). Remove the DB constraint (Redis alone lets some through after key expiry). Seeing both fail alone shows why you need both.
+
+**Check:** 1000 duplicate submits across many threads produce exactly one order row and one set of fills.
+
+---
+
+## Step 18: REST API and WebSocket feed (5 hours)
+
+**Learn**
+- A controller turns HTTP into an engine call. Map results to status codes: 200 accepted, 400 rejected, 429 overloaded.
+- **WebSocket:** one long-lived connection where the server pushes data (trades, price updates) to the client.
+- **The slow-client problem:** if the matcher thread writes to a slow client, the matcher blocks and the whole exchange stalls. **Never write to a socket from the matcher thread.**
+- Fix: each client session gets its own small bounded queue and a sender. If the queue fills, drop old updates or disconnect the client.
+
+**Build (REST, 2 hours)**
+- Spring Boot app wrapping the engine behind an interface:
+  - `POST /orders`, `DELETE /orders/{id}`, `GET /book/{symbol}` (reads the Step 12 snapshot).
+- A load script that posts orders from many threads.
+
+**Build (WebSocket, 3 hours)**
+- Endpoint `/feed/{symbol}` pushing each new snapshot and each trade.
+- The matcher puts events on an outbound bounded queue. A broadcaster thread copies them into each client's own bounded queue.
+
+**Break it:** write to a deliberately slow client directly from the matcher thread. Watch matching throughput collapse. Then switch to per-client queues.
+
+**Check:** one stalled client does not reduce matching throughput. The feed shows trades consistent with the book.
+
+---
+
+## Step 19: JMH benchmarks and StampedLock (3 hours)
+
+**Learn**
+- Hand-made `System.nanoTime()` timing lies: the JVM warms up, and the compiler can delete code whose result is unused. **JMH** is the standard tool that handles this: warmup, multiple forks, `Blackhole`.
+- Key annotations: `@Benchmark`, `@State(Scope.Benchmark)`, `@Threads(n)`, `@BenchmarkMode(Mode.Throughput)`, `@Warmup`, `@Measurement`, `@Fork(2)`.
+- **`StampedLock`** has an **optimistic read**: read without any lock, then check nothing changed.
+```java
+long stamp = sl.tryOptimisticRead();
+Snapshot s = copyFields();
+if (!sl.validate(stamp)) {          // a writer slipped in, fall back to a real read lock
+    stamp = sl.readLock();
+    try { s = copyFields(); } finally { sl.unlockRead(stamp); }
+}
+```
+- It is **not reentrant**. Do not take it twice in one thread.
+
+**Build:** a JMH module that benchmarks:
+- `synchronized` vs `ReentrantLock` vs sharded engine
+- `AtomicLong` vs `LongAdder` vs `synchronized` counter at 1, 4, 16 threads
+- `ReadWriteLock` vs `StampedLock` optimistic vs volatile snapshot at 1, 4, 16 readers
+
+**Check:** `docs/benchmarks.md` has one table per comparison with your machine specs. Every performance claim in your README points to a row.
+
+---
+
+## Step 20: Real market data replay (1 hour)
+
+**Learn**
+- Real prices make the demo convincing. Binance exposes public trade streams with no API key, for example the `btcusdt@trade` stream. Alternatively use a free LOBSTER sample file for Nasdaq stocks (check its terms).
+
+**Build**
+- Record a few minutes of trade prices to a file (one price per line).
+- Feed that price series to `OrderGenerator` as the mid price instead of the random walk. Everything else stays the same.
+
+**Check:** the feed from Step 18 shows prices that follow the real series.
+
+---
+
+## Step 21: Final stress run and README (2 hours)
+
+**Build**
+- Re-run the Step 14 stress test against the full system (including PostgreSQL totals). Add the invariant: database totals equal in-memory totals.
+- Final project README: architecture diagram, benchmark tables, and a **"Bugs I reproduced and fixed"** section with the race, the lost update (in memory and in the database), the deadlock (paste the real `jstack` text), the memory blow-up, the duplicate order, and the slow WebSocket client.
+
+**Check:** a fresh clone runs `docker-compose up -d`, `mvn test` is green, and `mvn spring-boot:run` serves the API and feed.
 
 ---
 
@@ -604,7 +750,7 @@ if (existing != null) return existing;      // duplicate: hand back the ORIGINAL
 | 19 | Immutability | 1, 12 |
 | 20 | Idempotency under concurrency | 13 |
 
-Also covered beyond the 20: Java Memory Model and `volatile` (6), `ConcurrentHashMap` (12, 13), `CountDownLatch` (11, 14), single-writer design (10).
+Also covered beyond the 20: Java Memory Model and `volatile` (6), `ConcurrentHashMap` (12, 13), `CountDownLatch` (11, 14), single-writer design (10), `CompletableFuture` and virtual threads (15), database isolation, optimistic and pessimistic locking (16), Redis `SET NX` (17), `StampedLock` and JMH (19).
 
 ## Final architecture
 
@@ -615,7 +761,7 @@ Client (REST)
 Intake thread pool (bounded queue, rejects when full)
    |
    v
-Idempotency check (putIfAbsent on clientOrderId)
+Idempotency check (Redis SET NX, then DB unique constraint)
    |
    v
 Reserve funds (per-account lock)
@@ -626,7 +772,8 @@ Shard router: hash(symbol) -> shard
    v
 Shard bounded queue --> ONE matcher thread owns the books (no locks on books)
                               |-> settle trades (account locks, lowest id first)
-                              |-> publish immutable market-data snapshot (volatile)
+                              |-> publish immutable market-data snapshot (volatile) --> WebSocket feed (per-client bounded queues)
+                              |-> trade events on bounded queue --> single DB writer thread --> PostgreSQL
 ```
 
 ## Invariants the stress test enforces
@@ -639,20 +786,8 @@ Shard bounded queue --> ONE matcher thread owns the books (no locks on books)
 - One order per `clientOrderId`
 - Reservations return to 0 when everything is cancelled
 - Single-threaded replay equals the golden file
+- Database totals equal in-memory totals
 
 ## Reading (read only the chapter for the step you are on)
 
-*Java Concurrency in Practice* (Goetz): ch. 1 to 3 (Steps 5, 6), ch. 5.3 (Step 10), ch. 6 and 8 (Step 11), ch. 10 (Step 8), ch. 12 (Step 14), ch. 15 (Step 9), ch. 16 (Step 6). Read it **after** you build, to fill gaps, not before.
-
-## After the 60 hours (extensions, not required)
-
-These are real topics but outside the 20 concepts, so they did not fit the budget:
-
-1. `CompletableFuture` pipelines and Java 21 virtual threads
-2. WebSocket live feed (and the slow-client problem)
-3. PostgreSQL persistence: transaction isolation levels, lost update, `@Version` optimistic locking, `SELECT FOR UPDATE`
-4. Redis `SET NX` as the fast idempotency layer, with a DB unique constraint behind it
-5. JMH benchmarks, `StampedLock`
-6. Replay real market data (Binance public stream or a LOBSTER sample)
-
-Database concurrency (3) is the most valuable of these for backend interviews. Do it first.
+*Java Concurrency in Practice* (Goetz): ch. 1 to 3 (Steps 5, 6), ch. 5.3 (Step 10), ch. 6 and 8 (Step 11), ch. 10 (Step 8), ch. 12 (Step 14), ch. 15 (Step 9), ch. 16 (Step 6). Read it **after** you build, to fill gaps, not before. For Step 16 also read *Designing Data-Intensive Applications* (Kleppmann) ch. 7 and the PostgreSQL docs page on transaction isolation.
