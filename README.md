@@ -1,195 +1,658 @@
-# ConcurEx
+# ConcurEx: Build a Concurrent Stock Exchange in Java
 
-A concurrent stock exchange backend in Java, built phase by phase to learn concurrency by implementing it, breaking it, and fixing it.
+Learn concurrency by building a mini stock exchange, breaking it on purpose, and fixing it.
+
+**Budget: 60 hours** (20 days x 3 hours). Every step below lists its hours. Learning time is included.
 
 ---
 
-## What is this?
+## What you are building
 
-ConcurEx is a mini stock exchange. It does what the core of NSE or Nasdaq does:
+A mini exchange, like the core of NSE or Nasdaq:
 
-- Traders submit **buy** and **sell** orders for a stock (limit or market).
-- Each stock has an **order book**: waiting buy orders and waiting sell orders.
-- When a buy price meets or exceeds a sell price, the engine creates a **trade**. The best price wins; ties go to the earliest order (price-time priority).
-- **Settlement** moves cash and shares between the buyer's and seller's accounts.
-- Clients see live prices (best bid/ask, depth, last trade) through a WebSocket feed.
+- People send **buy** and **sell** orders for a stock.
+- Each stock has an **order book**: a waiting list of buys and a waiting list of sells.
+- When a buy price is at or above a sell price, they **match** and a **trade** happens. Best price goes first. At the same price, the earlier order goes first.
+- **Settlement** moves money and shares between the two accounts.
 
-The exchange is the vehicle. **Concurrency is the actual subject.** Thousands of orders arrive at once, and the system must stay correct while they do.
+The exchange is only the vehicle. The real subject is: **what breaks when thousands of orders arrive at the same time, and how do you fix it?**
 
-### The correctness rules that make it hard
+**Stack:** Java 21, Maven, JUnit 5. Spring Boot only in the last step. No database, Redis or Docker in the core 60 hours.
 
-| Rule | Failure if broken | Concept it exercises |
+**Data:** none needed. You generate random orders with a seeded generator. Same seed = same orders every run.
+
+---
+
+## How every step works
+
+1. **Learn:** read the plain-words explanation (20 to 30 minutes).
+2. **Build:** write the code listed.
+3. **Break it:** cause the bug on purpose and watch it fail. This is where you actually learn.
+4. **Check:** the test that proves it works. Do not move on until it passes.
+5. **Note:** write 5 lines in `docs/topics/<step>.md` about what you learned. Link it from `docs/STUDY.md`.
+
+Order matters. Do not skip steps.
+
+---
+
+## Hour budget
+
+| Step | Topic | Hours |
 |---|---|---|
-| No two orders fill the same shares | Double fill | Race conditions, single-writer design |
-| Balances never go negative or lose money | Lost update | Locks, atomics, transactions |
-| A retried request creates exactly one order | Duplicate order | Idempotency |
-| Overload is rejected cleanly | OutOfMemory, crash | Bounded queues, backpressure |
-| Readers see consistent prices without slowing the matcher | Stale or torn reads, contention | Read-write locks, immutability |
-| Transfers between accounts never freeze | Deadlock | Lock ordering |
+| 0 | Setup | 1 |
+| 1 | Domain model | 1.5 |
+| 2 | Order book | 3 |
+| 3 | Matcher | 3.5 |
+| 4 | Order generator and golden file | 3 |
+| 5 | Threads and race conditions | 4 |
+| 6 | Locks and the memory model | 6 |
+| 7 | Accounts and settlement | 4 |
+| 8 | Deadlock and livelock | 5 |
+| 9 | Atomics | 3 |
+| 10 | Producer-consumer and sharding | 6 |
+| 11 | Thread pools, semaphores, backpressure | 6 |
+| 12 | Market data for many readers | 4 |
+| 13 | Idempotency | 3 |
+| 14 | Stress test | 4 |
+| 15 | REST API and final README | 3 |
+| | **Total** | **60** |
 
 ---
+
+## Step 0: Setup (1 hour)
+
+- Install JDK 21 and Maven. Create one Maven project (single module, simple).
+- Add JUnit 5.
+- Packages inside `src/main/java/concurex/`:
+
+```
+engine/        Order, Trade, OrderBook, Matcher
+account/       Account, AccountService
+concurrent/    Sequencer, Shard, Engine variants
+sim/           OrderGenerator, StressRunner
+drills/        small standalone demos
+api/           Spring Boot controllers (Step 15)
+```
+
+- Create `docs/STUDY.md` (an empty list of links) and a `docs/topics/` folder.
+
+---
+
+# Part 1: A correct single-threaded exchange (11 hours)
+
+You cannot debug concurrency bugs if you do not know what the correct answer is. Build the correct version first.
+
+## Step 1: Domain model (1.5 hours)
+
+**Learn**
+- **Limit order:** "buy up to this price" or "sell at least this price". If not fully matched, the leftover waits in the book.
+- **Market order:** "buy or sell now". The leftover is thrown away, never waits. To keep things safe, a market order here carries a **worst acceptable price** (like a limit), but it never rests in the book.
+- **Money is a `long` in ticks**, never `double`. Rs 100.50 is stored as `10050`. Reason: `0.1 + 0.2 != 0.3` in floating point, and money must add up exactly.
+- **Immutable** means the object cannot change after creation. Java `record` gives you that. Immutable objects are always safe to share between threads.
+- **No clock timestamps.** Time priority comes from the order id (a counter). Clocks make runs non-repeatable.
+
+**Build**
+```java
+public enum Side { BUY, SELL }
+public enum OrderType { LIMIT, MARKET }
+
+public record Order(long id, String clientOrderId, long accountId, String symbol,
+                    Side side, OrderType type, long priceTicks, long quantity) {
+    public Order {
+        Objects.requireNonNull(symbol);
+        if (quantity <= 0) throw new IllegalArgumentException("quantity");
+        if (priceTicks <= 0) throw new IllegalArgumentException("price");
+    }
+}
+
+public record Trade(long tradeId, String symbol, long buyOrderId, long sellOrderId,
+                    long buyAccountId, long sellAccountId,
+                    long priceTicks, long quantity, long buyLimitTicks) {}
+```
+(`buyLimitTicks` is the buyer's own order price. Settlement needs it in Step 7.)
+
+A resting order needs a changing "how much is left" value. Keep that outside the immutable order:
+```java
+class BookEntry { final Order order; long remaining; BookEntry(Order o, long r){ order=o; remaining=r; } }
+```
+
+**Break it**
+- Temporarily make `Order` a mutable class. After it is resting in the book, change its price. The book still has it at the old price level but it now reports a new price. Trades will happen at the wrong price. Revert to `record`.
+
+**Check:** tests that reject quantity <= 0, price <= 0, null symbol.
+
+---
+
+## Step 2: Order book (3 hours)
+
+**Learn**
+- Two sides: **bids** (buys, best = highest price first) and **asks** (sells, best = lowest price first).
+- At each price there is a queue. First in, first out. That is time priority.
+- Data structure: `TreeMap<price, ArrayDeque<BookEntry>>`. A `TreeMap` keeps prices sorted, so `firstKey()` is the best price. `ArrayDeque` is a fast FIFO queue.
+- To cancel by order id quickly, keep a `HashMap<orderId, BookEntry>`.
+
+**Build**
+```java
+public class OrderBook {
+    final TreeMap<Long, ArrayDeque<BookEntry>> bids = new TreeMap<>(Comparator.reverseOrder());
+    final TreeMap<Long, ArrayDeque<BookEntry>> asks = new TreeMap<>();
+    final HashMap<Long, BookEntry> byId = new HashMap<>();
+    // add(BookEntry), cancel(long orderId) -> Optional<BookEntry>, bestBid(), bestAsk()
+}
+```
+- `add`: put in the right side and price level, create the level if missing, add to `byId`.
+- `cancel`: look up in `byId`, remove from its level's deque, remove the level if now empty, remove from `byId`. Unknown id returns empty (decide and write down this rule).
+
+**Break it:** cancel the same order twice. Cancel an order that already fully traded. Make sure nothing crashes and empty price levels are removed.
+
+**Check:** tests for: two orders at same price come out in arrival order; better price comes out first; empty level disappears after cancel.
+
+---
+
+## Step 3: Matcher (3.5 hours)
+
+**Learn**
+- A new order **crosses** the book when: BUY price >= best ask, or SELL price <= best bid.
+- The **trade price is the resting order's price** (the one already waiting).
+- One order can match many resting orders (sweeping several price levels).
+- **Self-trade rule:** if the best resting order belongs to the same account, stop matching and drop the remainder of the incoming order. (Simple and consistent.)
+
+**Build** `Matcher.match(Order o)` returning `MatchResult(List<Trade> trades, long unrestedQty)`:
+
+```
+remaining = o.quantity
+opposite = (o is BUY) ? asks : bids
+while remaining > 0 and opposite is not empty:
+    price = best price on opposite
+    if price does not cross o.price: break
+    queue = opposite.get(price)
+    while remaining > 0 and queue is not empty:
+        resting = queue.peekFirst()
+        if resting.accountId == o.accountId: stop everything (self-trade rule)
+        qty = min(remaining, resting.remaining)
+        record Trade(price = resting price, qty)
+        remaining -= qty; resting.remaining -= qty
+        if resting.remaining == 0: queue.pollFirst(); byId.remove(...)
+    if queue is empty: remove that price level
+if remaining > 0 and o is LIMIT and no self-trade stop: add BookEntry(o, remaining) to the book; unrestedQty = 0
+else: unrestedQty = remaining
+```
+Trade ids: a plain `long` counter for now (you fix this in Step 9).
+
+**Break it:** feed orders that exactly cross, barely do not cross, sweep 5 levels, and self-trade.
+
+**Check:** tests: full fill, partial fill, price priority, time priority, market order sweep and discard, limit order rests, cancel. Property check: total quantity bought equals total quantity sold across all trades.
+
+---
+
+## Step 4: Order generator and golden file (3 hours)
+
+**Learn**
+- A **seeded** `new Random(42)` gives the same numbers every time. This makes bugs reproducible.
+- Model price as a **random walk**: the mid price moves a little each order. Orders land near the mid.
+- Hidden non-repeatability comes from: iterating a `HashSet`/`HashMap` of objects without stable hashing, `System.nanoTime()` in logic, `Math.random()`, thread timing.
+
+**Build**
+- `OrderGenerator(seed, symbols, numAccounts)` producing commands: ~85% new limit orders, ~10% market orders, ~5 to 15% cancels of a random earlier order id (a cancel of something already gone is fine; it just returns "not found").
+- Order ids come from a counter in the generator.
+- `Replay`: run N commands through the matcher and write all trades to `golden.txt`, one per line.
+
+**Break it:** run twice. If the files differ, find the hidden non-repeatability and remove it.
+
+**Check:** two runs with the same seed produce **byte-identical** output. Commit that as your **golden file**. In every later step, the single-threaded engine must still reproduce it.
+
+---
+
+# Part 2: Threads, locks, and the memory model (22 hours)
+
+## Step 5: Threads and race conditions (4 hours)
+
+**Learn**
+- **Thread:** one independent line of execution inside your program. Many threads share the same memory.
+- **Concurrency** = many tasks making progress by taking turns. **Parallelism** = tasks literally running at the same instant on different CPU cores.
+- **Process** = separate program with separate memory. **Thread** = lives inside a process and shares memory. Sharing is fast but dangerous.
+- **Thread states in Java:** NEW, RUNNABLE, BLOCKED (waiting for a lock), WAITING / TIMED_WAITING (waiting for a signal or time), TERMINATED.
+- **Race condition:** two threads touch the same data, and the result depends on who is faster.
+- `count++` is really three steps: read, add, write. Two threads can both read 5 and both write 6. One increment is lost.
+- Tools: `new Thread(runnable)`, `start()`, `join()` (wait for it to finish), `interrupt()`.
+
+**Drill (do this first, 30 minutes)**
+```java
+public class RaceDemo {
+    static int count = 0;
+    public static void main(String[] a) throws Exception {
+        Thread[] ts = new Thread[10];
+        for (int i = 0; i < 10; i++) {
+            ts[i] = new Thread(() -> { for (int j = 0; j < 100_000; j++) count++; });
+            ts[i].start();
+        }
+        for (Thread t : ts) t.join();
+        System.out.println(count); // you expect 1,000,000. You get less.
+    }
+}
+```
+
+**Build**
+- `NaiveEngine`: one shared `Matcher` and a `submit(Command)` method with **no protection**.
+- Test harness: 8 threads, each submitting a slice of generated commands.
+
+**Break it:** run it in a loop of 200 runs. You should see exceptions from the `TreeMap`, duplicate trade ids, or an order filled more than its quantity.
+
+**Check:** write a test that fails reliably (within the 200 runs). Assert: no exceptions, trade ids unique, no order's total filled quantity is more than its quantity. **This failing test is your regression test for the next steps.**
+
+---
+
+## Step 6: Locks and the memory model (6 hours)
+
+**Learn**
+- **`synchronized`**: only one thread at a time can be inside blocks guarded by the same object. Others wait (BLOCKED).
+- **`ReentrantLock`**: same idea, as an object. Extra powers: `tryLock()` (do not wait forever), fairness, and `Condition`. Always unlock in `finally`.
+- **Reentrant** means the same thread can take the same lock again without blocking itself.
+- **`volatile`**: guarantees that a write by one thread is **visible** to other threads. It does **not** make `count++` safe.
+- **Why visibility matters:** each CPU core and the JIT compiler may cache a variable. Without `volatile` or a lock, a reader thread can keep seeing an old value forever.
+- **Happens-before (the Java Memory Model rule):** everything a thread did before releasing a lock is visible to the next thread that takes the same lock. Same for a volatile write followed by a volatile read. This is why locks fix visibility too.
+- **`wait/notify`** and **`Condition`**: "sleep until someone says the condition is true". Always check the condition in a `while` loop, never `if`.
+- **Coarse lock** = one big lock for everything (simple, slow). **Fine-grained** = many small locks (faster, easier to get wrong).
+
+**Drill (1.5 hours)**
+- Fix the Step 5 counter three ways: `synchronized`, `ReentrantLock`, `AtomicInteger`.
+- Volatile demo:
+```java
+static boolean running = true;   // try with and without volatile
+Thread t = new Thread(() -> { while (running) { } });
+t.start(); Thread.sleep(1000); running = false; t.join();  // often hangs without volatile
+```
+
+**Build**
+- `SyncEngine`: `public synchronized Result submit(Command c)`.
+- `LockEngine`: same with `ReentrantLock`:
+```java
+lock.lock();
+try { /* match */ } finally { lock.unlock(); }
+```
+- Timing: run 1 million generated orders on 1 thread, then on 8 threads with each engine. Print orders per second. (A simple `System.nanoTime()` timer is enough.) Save numbers in `docs/benchmarks.md`.
+
+**Break it**
+- Remove `volatile` from the stop flag. Watch the hang.
+- Put a `System.out.println` inside the locked section. Watch throughput collapse (never do slow work while holding a lock).
+
+**Check:** the Step 5 failing test now passes 200 times in a row. The single-threaded golden file still matches.
+
+---
+
+## Step 7: Accounts and settlement (4 hours)
+
+**Learn**
+- Each account has `cash` and `shares` per symbol.
+- **Reservation:** when you place an order, the money or shares you would need are set aside so you cannot spend them twice. Fields: `reservedCash`, `reservedShares`.
+- Rules:
+  1. **Before** an order enters the book: BUY needs `cash - reservedCash >= price x qty`, then `reservedCash += price x qty`. SELL needs `shares - reservedShares >= qty`, then `reservedShares += qty`. Otherwise reject the order.
+  2. **On each trade** at price `p`, quantity `q`:
+     - Buyer: `cash -= p x q`, `shares += q`, `reservedCash -= buyLimitTicks x q`
+     - Seller: `cash += p x q`, `shares -= q`, `reservedShares -= q`
+  3. **When an order ends with leftover** (cancelled, market remainder thrown away, self-trade stop): release it. BUY: `reservedCash -= price x leftover`. SELL: `reservedShares -= leftover`.
+- The buyer's price improvement (limit 100, trade at 98) is handled by rule 2 automatically: you remove the full `buyLimitTicks x q` from the reservation but only charge `p x q` in cash.
+
+**Build**
+- `Account` and `AccountService` (a map of accounts; seed 1000 accounts with fixed cash and shares).
+- `reserve(order)`, `settle(trade)`, `release(order, leftoverQty)`.
+- Engine flow: reserve, match, settle each trade, release `unrestedQty` (and on cancel, release the cancelled entry's `remaining`).
+- Extend the generator to create accounts with known starting totals.
+
+**Break it:** in `SyncEngine`, move `settle` **outside** the lock. Run 8 threads. Total cash stops adding up (lost updates). Move it back.
+
+**Check (single-threaded replay and 8-thread run):**
+- Total cash across all accounts never changes.
+- Total shares per symbol never changes.
+- No account has negative cash or negative shares.
+- After cancelling every resting order, `reservedCash` and `reservedShares` are 0 everywhere.
+
+---
+
+## Step 8: Deadlock and livelock (5 hours)
+
+**Learn**
+- **Deadlock:** thread A holds lock 1 and waits for lock 2. Thread B holds lock 2 and waits for lock 1. Nobody moves, forever.
+- Needs all four: mutual exclusion, hold-and-wait, no preemption, circular wait. **Break circular wait** and deadlock cannot happen.
+- **Fix = lock ordering:** always take locks in the same global order (for example, lowest account id first).
+- **Livelock:** threads keep reacting to each other and stay busy but make no progress (two people stepping aside in a corridor, forever). Fix: random wait before retrying.
+- `tryLock(timeout)` avoids waiting forever, but you must handle the "failed" case.
+- **Reading a thread dump:** run `jps` to get the process id, then `jstack <pid>`. Look for the text `Found one Java-level deadlock`. It shows each thread, the lock it holds and the lock it wants.
+
+**Drill (1.5 hours)**
+```java
+Object a = new Object(), b = new Object();
+new Thread(() -> { synchronized (a) { sleep(100); synchronized (b) { } } }).start();
+new Thread(() -> { synchronized (b) { sleep(100); synchronized (a) { } } }).start();
+// run it, then jstack it
+```
+Then write a livelock: two threads each `tryLock` both locks, and on failure release and retry immediately. Fix with a random sleep.
+
+**Build**
+- Give every `Account` its own `ReentrantLock`.
+- `settle(trade)` locks **both** accounts. Lock the lower account id first, then the higher.
+```java
+Account first = byId(Math.min(t.buyAccountId(), t.sellAccountId()));
+Account second = byId(Math.max(t.buyAccountId(), t.sellAccountId()));
+first.lock.lock();
+try { second.lock.lock(); try { apply(t); } finally { second.lock.unlock(); } }
+finally { first.lock.unlock(); }
+```
+(The matcher never makes a trade between the same account, so first and second differ.)
+- Reservation changes lock only the one account involved.
+
+**Break it:** lock in (buyer, seller) order instead. Then run two threads settling trades "A buys from B" and "B buys from A" many times. It hangs. Capture the `jstack` output, find the deadlock text, and paste it in your notes.
+
+**Check:** 1000 threads each settling opposite-direction trades finish with no hang and conserved totals.
+
+---
+
+## Step 9: Atomics (3 hours)
+
+**Learn**
+- An **atomic** operation happens completely or not at all; no thread sees it half done.
+- **CAS (compare-and-set):** "set the value to 8 only if it is still 7". Returns true or false. No lock needed. If it fails, you retry.
+- `AtomicLong.incrementAndGet()` does this for you.
+- `LongAdder` is faster than `AtomicLong` when many threads only **add** (counters), because it spreads the work. Reading it is slower.
+- **Non-blocking** means threads never wait on a lock. They retry instead. **Blocking** means they wait.
+- **ABA problem** (concept only): a value changes 7 to 9 to 7 and CAS cannot tell. Not an issue for counters.
+
+**Drill (30 minutes):** write your own CAS counter and compare with `AtomicLong`:
+```java
+AtomicLong v = new AtomicLong();
+long next() {
+    while (true) {
+        long cur = v.get();
+        if (v.compareAndSet(cur, cur + 1)) return cur + 1;
+    }
+}
+```
+
+**Build**
+- `Sequencer` with an `AtomicLong`: used for order ids and trade ids (replace the plain counters).
+- `Metrics`: `LongAdder` counters for orders received, trades made, orders rejected.
+
+**Break it:** replace the sequencer with plain `long++`. Run 1000 threads. Duplicate ids appear.
+
+**Check:** 1000 threads take 100 ids each: exactly 100,000 unique ids, with no gaps.
+
+---
+
+# Part 3: Making it scale (19 hours)
+
+## Step 10: Producer-consumer and per-symbol sharding (6 hours)
+
+**Learn**
+- **Producer-consumer:** some threads produce work, others consume it, and a **queue** sits between them. The queue lets both sides run at their own speed.
+- **`BlockingQueue`:**
+  - `put()` waits if the queue is full. `take()` waits if it is empty.
+  - `offer()` returns false immediately if full. `poll()` returns null immediately if empty.
+  - `ArrayBlockingQueue` has a fixed size (bounded). `LinkedBlockingQueue` is unbounded by default (dangerous).
+- **Single-writer principle:** if exactly **one** thread ever touches a piece of data, you need **no lock**. So give each symbol's order book to one matcher thread.
+- **Sharding:** pick the thread by `symbol` so the same symbol always goes to the same thread: `Math.floorMod(symbol.hashCode(), numShards)`.
+- Time priority now equals the order in which commands reach that shard's queue.
+
+**Drill (1.5 hours)**
+- Write a bounded buffer using `synchronized`, `wait()` and `notifyAll()`:
+```java
+class BoundedBuffer<T> {
+    private final Queue<T> q = new ArrayDeque<>(); private final int cap;
+    BoundedBuffer(int cap) { this.cap = cap; }
+    synchronized void put(T x) throws InterruptedException { while (q.size() == cap) wait(); q.add(x); notifyAll(); }
+    synchronized T take() throws InterruptedException { while (q.isEmpty()) wait(); T x = q.remove(); notifyAll(); return x; }
+}
+```
+- Rewrite it with `ArrayBlockingQueue`. Compare how much shorter and safer it is.
+
+**Build**
+```java
+class Shard implements Runnable {
+    final BlockingQueue<Command> queue = new ArrayBlockingQueue<>(10_000);
+    final Map<String, OrderBook> books = new HashMap<>();   // only THIS thread touches it
+    public void run() {
+        try {
+            while (true) {
+                Command c = queue.take();
+                if (c == POISON) break;
+                handle(c);                       // match, settle, complete c.result
+            }
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+```
+- `ShardedEngine.submit(cmd)`: assign an id from the `Sequencer`, reserve funds, pick a shard, `offer()` the command. Each command carries a `CompletableFuture<Result>` (think of it as a box the caller can wait on; the shard fills it in with `complete(result)`).
+- Shutdown: put `POISON` into each queue, then `join` the shard threads.
+- Settlement uses the per-account locks from Step 8.
+
+**Break it**
+- Let a second thread read an order book "just to look". Run the stress test. It races.
+- Make the queue unbounded and flood it faster than the shard can consume. Memory grows (this sets up Step 11).
+
+**Check:**
+- The Step 5 stress test passes with **no lock on the order book**.
+- For each symbol, the trades match a single-threaded replay of the commands that shard received, in the order it received them.
+- 8 symbols on 4 shards is faster than the Step 6 coarse-lock engine. Record both numbers.
+
+---
+
+## Step 11: Thread pools, semaphores, backpressure (6 hours)
+
+**Learn**
+- **Thread pool:** a fixed set of worker threads reused for many tasks. Creating a thread per request is slow and can crash you.
+- **`ThreadPoolExecutor(core, max, keepAlive, unit, queue, threadFactory, rejectionPolicy)`**
+  - Extra threads beyond `core` are created **only when the queue is full**.
+  - With an **unbounded** queue, `max` is never used and overload is hidden until you run out of memory.
+- **Rejection policies when queue and threads are full:**
+  - `AbortPolicy`: throws `RejectedExecutionException` (use this, return "overloaded", later HTTP 429).
+  - `CallerRunsPolicy`: the submitting thread does the work itself, which slows the producer down. That is natural backpressure.
+  - `DiscardPolicy`: silently drops (almost always wrong).
+- **Backpressure:** when the system is overloaded, push back on the sender (reject or slow down) instead of buffering without limit.
+- **`Semaphore(n)`:** n permits. `acquire()` takes one (waits if none), `release()` returns one. `tryAcquire()` does not wait. Use it to limit how many things happen at once.
+- **`CountDownLatch(n)`:** wait until a count reaches zero. You use it to make 1000 threads start at exactly the same moment in tests.
+- Shutdown: `shutdown()` (finish queued work) vs `shutdownNow()` (interrupt), then `awaitTermination`.
+
+**Drill (2 hours)**
+- Connection pool using a `Semaphore` (permits = pool size) and a `BlockingQueue<Connection>`:
+```java
+Conn acquire() throws InterruptedException { permits.acquire(); return conns.take(); }
+void release(Conn c) { conns.add(c); permits.release(); }
+```
+- A tiny thread pool from scratch: N worker threads looping on `queue.take()`, an `execute(Runnable)` using `queue.offer()` that rejects if full.
+
+**Build**
+- Intake pool in front of the engine:
+```java
+AtomicInteger n = new AtomicInteger();
+var pool = new ThreadPoolExecutor(4, 4, 0L, TimeUnit.SECONDS,
+        new ArrayBlockingQueue<>(1000),
+        r -> new Thread(r, "intake-" + n.incrementAndGet()),   // named threads make thread dumps readable
+        new ThreadPoolExecutor.AbortPolicy());
+try { pool.execute(task); } catch (RejectedExecutionException e) { return Result.OVERLOADED; }
+```
+- If a shard queue `offer()` returns false: return `OVERLOADED` and **release the reservation** you took.
+- Per-account cap using `Semaphore`: max 50 orders in flight per account (`tryAcquire`, release when the result is complete).
+
+**Break it**
+- Switch the intake queue to unbounded, run with `-Xmx64m`, and flood it. Watch heap climb and an `OutOfMemoryError`.
+- Switch back to bounded + `AbortPolicy`. It stays alive and sheds load.
+- Try `CallerRunsPolicy`. Compare: producers slow down instead of getting errors.
+
+**Check:** send 10x the capacity. Memory stays flat, rejected count is greater than 0, and every **accepted** order still reaches a final result.
+
+---
+
+## Step 12: Market data for many readers (4 hours)
+
+**Learn**
+- Clients constantly read "best bid, best ask, last price, top 5 levels". Only the matcher writes. Many readers, one writer.
+- **Approach A: `ReentrantReadWriteLock`.** Many readers at once, but a writer needs exclusive access. Simple, but readers and the writer block each other.
+- **Approach B: immutable snapshot.** After each command the matcher builds a brand new immutable `Snapshot` object and stores it in a `volatile` field. Readers just read the field. No lock, and they always see one consistent picture.
+```java
+record Snapshot(long bestBid, long bestAsk, long lastTrade, List<Level> bids, List<Level> asks) {}
+volatile Snapshot snapshot;                       // matcher: snapshot = build();  readers: snapshot
+```
+Use `List.copyOf(...)` so the lists inside are immutable.
+- **Why the snapshot is safe:** the object is immutable, and the `volatile` write makes it fully visible to readers (this is "safe publication").
+- **Starvation** (concept): a thread never gets its turn. Locks can be fair (`new ReentrantReadWriteLock(true)`) at a speed cost.
+- **Concurrent collections (concept):** `ConcurrentHashMap` is a thread-safe map with fine-grained internal locking; use it for shared maps (accounts, Step 13). `CopyOnWriteArrayList` copies the whole array on every write; good only for rarely-changed lists.
+
+**Drill (1 hour):** a cache with 16 reader threads and 1 writer, once with a read-write lock, once with a snapshot swap. Time both.
+
+**Build**
+- `MarketData` per symbol with Approach A and Approach B behind one interface.
+- Matcher thread updates it after every command.
+- A reader test: 16 reader threads loop reading.
+
+**Break it:** store `bestBid` and `bestAsk` in two separate fields instead of one snapshot. Readers will sometimes see a new bid with an old ask (an impossible book). Run the reader test until it catches it.
+
+**Check:** readers never see `bestBid >= bestAsk` or inconsistent depth. Timing table: lock vs snapshot at 1, 4 and 16 readers.
+
+---
+
+## Step 13: Idempotency under concurrency (3 hours)
+
+**Learn**
+- Clients retry: a timeout, a double-click, a network glitch. The same order may arrive twice or 100 times at once. Only **one** order must be created.
+- **Idempotent** = repeating the request has the same effect as doing it once. The client sends a unique `clientOrderId`. The key is `accountId + ":" + clientOrderId`.
+- **The trap:** check-then-act is a race.
+```java
+if (!seen.containsKey(key)) { seen.put(key, ...); process(); }   // two threads can both pass the check
+```
+- **The fix:** one atomic operation, `putIfAbsent`:
+```java
+CompletableFuture<Result> mine = new CompletableFuture<>();
+CompletableFuture<Result> existing = seen.putIfAbsent(key, mine);   // seen is a ConcurrentHashMap
+if (existing != null) return existing;      // duplicate: hand back the ORIGINAL result, not an error
+// I am the first: process the order, then mine.complete(result)
+```
+- **In production** the same idea uses Redis `SET key NX` (fast check) plus a database unique constraint on `(accountId, clientOrderId)` (the truth that survives restarts). The concept is identical; you build the in-memory version.
+
+**Build:** add the dedupe to `submit()` before reservation and routing.
+
+**Break it:** use the `containsKey` version. Fire 100 threads with the same key using a `CountDownLatch`. You get several orders.
+
+**Check:** 1000 threads submit the **same** `clientOrderId`: exactly one order exists, exactly one reservation was made, all 1000 callers receive the same result.
+
+---
+
+# Part 4: Prove it and ship it (7 hours)
+
+## Step 14: Stress test (4 hours)
+
+**Learn**
+- A concurrent test that passes once proves almost nothing. Bugs depend on timing.
+- Method: run lots of threads, lots of times, with random timing nudges, and check **invariants** (things that must always be true) at the end.
+- Nudging timing: sprinkle `if (rnd.nextInt(100) == 0) Thread.yield();` at critical points to shuffle the thread schedule.
+- Use a `CountDownLatch` so all threads start together.
+
+**Build** `StressRunner`:
+- N threads, each submitting M generated orders (random symbols and accounts; some duplicates, some cancels).
+- Wait for everything to finish, drain, then check **all invariants**:
+  - No negative cash or shares anywhere.
+  - Total cash and total shares conserved.
+  - Order ids and trade ids unique.
+  - No order filled more than its quantity.
+  - Every order ended in exactly one final state: filled, partly filled and resting, cancelled, rejected, or overloaded.
+  - Duplicate `clientOrderId`s created exactly one order.
+  - After cancelling all resting orders, all reservations are 0.
+- Loop 500 times with different seeds.
+
+**Break it:** re-introduce each old bug one at a time (unsynchronized submit, settle outside lock, lock in wrong order, plain `long++`, `containsKey` check). Confirm the stress test catches **every one**. A test that can never fail is worthless.
+
+**Check:** 500 consecutive clean runs on the correct engine.
+
+---
+
+## Step 15: REST API and final README (3 hours)
+
+**Build**
+- A minimal Spring Boot app wrapping `ShardedEngine`:
+  - `POST /orders` (200 accepted, 400 rejected, 429 overloaded)
+  - `DELETE /orders/{id}`
+  - `GET /book/{symbol}` (reads the Step 12 snapshot)
+- A small load script that posts orders from many threads.
+- Final project README with: architecture diagram, the speed tables from Steps 6, 10 and 12, and a **"Bugs I reproduced and fixed"** section with the race, the lost update, the deadlock (paste the real `jstack` text), the memory blow-up, and the duplicate order.
+
+**Check:** a fresh clone runs with `mvn test` green and `mvn spring-boot:run` serves the API.
+
+---
+
+# Reference
+
+## Where each of the 20 concepts is covered
+
+| # | Concept | Step |
+|---|---|---|
+| 1 | Concurrency | 5 |
+| 2 | Concurrency vs parallelism | 5, 10 |
+| 3 | Processes vs threads | 5 |
+| 4 | Thread lifecycle | 5, 8 |
+| 5 | Race condition | 5, 6 |
+| 6 | Mutex | 6 |
+| 7 | Semaphore | 11 |
+| 8 | Condition variable | 6, 10 |
+| 9 | Coarse vs fine-grained locking | 6, 8, 10 |
+| 10 | Reentrant lock | 6 |
+| 11 | Deadlock | 8 |
+| 12 | Livelock | 8 |
+| 13 | Starvation | 12 (concept) |
+| 14 | Atomic operations | 9 |
+| 15 | Thread pool | 11 |
+| 16 | Producer-consumer | 10 |
+| 17 | Blocking vs non-blocking | 9, 10 |
+| 18 | Backpressure | 11 |
+| 19 | Immutability | 1, 12 |
+| 20 | Idempotency under concurrency | 13 |
+
+Also covered beyond the 20: Java Memory Model and `volatile` (6), `ConcurrentHashMap` (12, 13), `CountDownLatch` (11, 14), single-writer design (10).
 
 ## Final architecture
 
 ```
-REST API
+Client (REST)
    |
    v
-Intake thread pool (bounded queue, rejection policy)
+Intake thread pool (bounded queue, rejects when full)
    |
    v
-Idempotency check (clientOrderId)
+Idempotency check (putIfAbsent on clientOrderId)
    |
    v
-Shard router (hash by symbol)
+Reserve funds (per-account lock)
    |
    v
-Per-symbol bounded queue  -->  single matcher thread per symbol
+Shard router: hash(symbol) -> shard
    |
    v
-Trade events  -->  Settlement (ordered locks / transactions)  -->  PostgreSQL
-   |
-   v
-Immutable market-data snapshot  -->  WebSocket feed
+Shard bounded queue --> ONE matcher thread owns the books (no locks on books)
+                              |-> settle trades (account locks, lowest id first)
+                              |-> publish immutable market-data snapshot (volatile)
 ```
 
-Key design decision: each symbol has **one matcher thread** that owns its order book. The book itself needs no locks. Concurrency is handled at the edges (intake, settlement, market-data reads), which is how real low-latency engines are designed.
+## Invariants the stress test enforces
 
----
+- No negative cash or shares
+- Total cash and shares conserved
+- Unique order ids and trade ids
+- No order filled more than its quantity
+- One final state per order
+- One order per `clientOrderId`
+- Reservations return to 0 when everything is cancelled
+- Single-threaded replay equals the golden file
 
-## Tech stack
+## Reading (read only the chapter for the step you are on)
 
-- Java 21 (virtual threads), Spring Boot
-- PostgreSQL (orders, trades, balances), Redis (idempotency keys)
-- JUnit 5, JMH (benchmarks), Docker
-- The matching core is **plain Java with no framework**, so it stays fast and testable.
+*Java Concurrency in Practice* (Goetz): ch. 1 to 3 (Steps 5, 6), ch. 5.3 (Step 10), ch. 6 and 8 (Step 11), ch. 10 (Step 8), ch. 12 (Step 14), ch. 15 (Step 9), ch. 16 (Step 6). Read it **after** you build, to fill gaps, not before.
 
----
+## After the 60 hours (extensions, not required)
 
-## Test data
+These are real topics but outside the 20 concepts, so they did not fit the budget:
 
-No real market data is needed. A **seeded synthetic order generator** produces random limit, market, and cancel orders around a moving mid price. The same seed gives the same input every run, which makes tests and benchmarks reproducible. A real-data replay (Binance or LOBSTER sample) is added at the end as a demo.
+1. `CompletableFuture` pipelines and Java 21 virtual threads
+2. WebSocket live feed (and the slow-client problem)
+3. PostgreSQL persistence: transaction isolation levels, lost update, `@Version` optimistic locking, `SELECT FOR UPDATE`
+4. Redis `SET NX` as the fast idempotency layer, with a DB unique constraint behind it
+5. JMH benchmarks, `StampedLock`
+6. Replay real market data (Binance public stream or a LOBSTER sample)
 
----
-
-## The 20 concurrency concepts and where each is covered
-
-Source list: 20 must-know concepts for concurrency in system design.
-
-| # | Concept | Where it is covered | Depth |
-|---|---|---|---|
-| 1 | Concurrency | Phase 1: concurrent order submission | Build |
-| 2 | Concurrency vs parallelism | Phase 1 and Phase 5: matchers on multiple cores, Amdahl's law, benchmarks | Understand + measure |
-| 3 | Processes vs threads | Phase 1 (study only), Phase 8: platform vs virtual threads | Understand |
-| 4 | Thread lifecycle | Phase 1, Phase 3: states, reading states in thread dumps | Understand + observe |
-| 5 | Race condition | Phase 1: reproduce lost orders and double fills with a failing test | Build + break |
-| 6 | Mutex | Phase 2: `synchronized` and `ReentrantLock` on the book | Build |
-| 7 | Semaphore | Phase 6: per-client rate cap, connection pool drill | Build |
-| 8 | Condition variable | Phase 2: `wait/notify` and `Condition` in producer-consumer drill | Build |
-| 9 | Coarse vs fine-grained locking | Phase 2 (one big lock), Phase 3 (per-account locks), Phase 5 (sharding by symbol) | Build + benchmark |
-| 10 | Reentrant lock | Phase 2: `ReentrantLock` in the engine | Build |
-| 11 | Deadlock | Phase 3: two-account transfer deadlock, `jstack`, lock-ordering fix | Build + break + fix |
-| 12 | Livelock | Phase 3: small `tryLock` retry demo | Understand + demo |
-| 13 | Starvation | Phase 7: writer starvation with read-write locks, fair vs unfair locks | Understand + demo |
-| 14 | Atomic operations | Phase 4: lock-free order and trade IDs, `LongAdder` metrics, CAS | Build |
-| 15 | Thread pool | Phase 6: `ThreadPoolExecutor` with bounded queue and rejection policy | Build |
-| 16 | Producer-consumer | Phase 5: bounded `BlockingQueue` per symbol feeding the matcher | Build |
-| 17 | Blocking vs non-blocking | Phase 5 (blocking queue), Phase 4 (CAS), Phase 8 (`CompletableFuture`, virtual threads) | Build + compare |
-| 18 | Backpressure | Phase 6: reject with HTTP 429 vs caller-runs under overload test | Build |
-| 19 | Immutability | Phase 0 (immutable `Order` and `Trade`), Phase 7 (immutable market-data snapshots) | Build + benchmark |
-| 20 | Idempotency under concurrency | Phase 9: `clientOrderId`, Redis and DB unique constraints, retry-storm test | Build |
-
-### Beyond the 20 (important for real backend work)
-
-| Topic | Phase |
-|---|---|
-| Java Memory Model: `volatile`, visibility, happens-before | Phase 2 |
-| `ConcurrentHashMap` internals, `CopyOnWriteArrayList` | Phase 7 |
-| `CountDownLatch`, `CyclicBarrier` | Phase 6 |
-| `CompletableFuture` chaining and error handling | Phase 8 |
-| Virtual threads (Java 21) | Phase 8 |
-| DB transactions, isolation levels, lost update, write skew | Phase 9 |
-| Optimistic (`@Version`) vs pessimistic (`SELECT FOR UPDATE`) locking | Phase 9 |
-
-### What is only conceptual
-
-Processes vs threads and thread lifecycle are theory, observed through tools but not "built". Livelock and starvation get short demos, not full features. Distributed locks (Redis/Redlock) are studied for caveats but not a core deliverable.
-
----
-
-## Warm-up drills
-
-Before the main phases, five small standalone programs (`drills/` module):
-
-1. A race condition, fixed three ways
-2. A producer-consumer queue (`wait/notify`, then `BlockingQueue`)
-3. A connection pool using a `Semaphore`
-4. A deadlock on purpose, then fixed
-5. A thread pool with a bounded queue, written from scratch
-
----
-
-## Roadmap: study, then implement
-
-Every phase has the same shape: **study** the concept, **implement** it in ConcurEx, then pass a **done-check**.
-
-| Phase | Focus | Implement | Done when |
-|---|---|---|---|
-| 0 | Single-threaded baseline | Order, Trade, OrderBook, `match()`, cancel, tests | Fixed input gives identical trades every run |
-| 1 | Threads and race conditions | Naive concurrent `submit()` | A failing test reproduces the race |
-| 2 | Locks and memory model | Coarse lock, then `ReentrantLock`, benchmark both | Race test passes, throughput recorded |
-| 3 | Accounts and deadlock | Settlement with transfers; cause, capture, and fix a deadlock | No deadlock, no negative balances under stress |
-| 4 | Atomics | Lock-free ID sequencer and metrics | IDs unique and gap-free under 1000 threads |
-| 5 | Producer-consumer and sharding | Bounded queue per symbol, single matcher thread | Throughput beats Phase 2, book needs no locks |
-| 6 | Thread pools and backpressure | Intake pool, rejection policy, semaphore rate cap | Overload is rejected cleanly |
-| 7 | Read-heavy market data | `ReadWriteLock` vs immutable snapshot, JMH comparison | Benchmark table produced |
-| 8 | Async pipeline | `CompletableFuture` order lifecycle, virtual threads | p50 and p99 latency measured |
-| 9 | Database concurrency and idempotency | PostgreSQL persistence, optimistic locking, idempotent submit | Duplicate submits yield exactly one order |
-| 10 | Stress and polish | Invariant-checking stress harness, README with benchmarks | Invariants hold over N runs |
-
-Phases 1 to 5 plus Phase 9 are the interview-critical core.
-
----
-
-## Invariants verified by the stress harness
-
-- No account balance ever goes negative
-- No order is filled for more than its quantity (no double fill)
-- Total cash and total shares across all accounts are conserved
-- Every accepted `clientOrderId` produces exactly one order
-- Output for a given seed is identical across runs (matcher determinism)
-
----
-
-## Planned repository layout
-
-```
-concurex/
-  README.md
-  docs/
-    STUDY.md          index of study notes
-    topics/           one file per concept studied
-  drills/             five warm-up programs
-  engine-core/        Order, Trade, OrderBook, Matcher (plain Java)
-  concurrency/        sequencer, shard router, bounded queues, executors
-  accounts/           balances, settlement, locking
-  api/                Spring Boot REST + WebSocket
-  persistence/        JPA repositories, idempotency
-  bench/              JMH benchmarks, stress harness, order generator
-```
-
----
-
-## Resources
-
-- *Java Concurrency in Practice* by Brian Goetz (chapters 1-8 and 15 at minimum)
-- Baeldung concurrency tutorials for syntax reference
-- JMH documentation for benchmarking
-
----
-
-## Resume summary
-
-> Built a concurrent exchange backend in Java with per-symbol sharded matching, idempotent order intake, and settlement verified under stress tests. Reproduced and fixed race conditions and deadlocks, and benchmarked lock strategies (X orders/sec, p99 Y ms).
-
-*(Fill in X and Y with real measurements after Phase 10.)*
+Database concurrency (3) is the most valuable of these for backend interviews. Do it first.
